@@ -25,10 +25,10 @@ ros2 run rosA wheel_odom_publisher --ros-args \
   -p topic:=/odom -p publish_tf:=true
 
 
-
 ros2 run rosA wheel_odom_publisher --ros-args \
   -p serial_port:=/dev/ttyACM0 -p baudrate:=115200 \
   -p cmd_topic:=/cmd_vel -p max_v:=0.30 -p max_w:=2.0 \
   -p odom_topic:=/odom -p frame_id:=odom -p child_frame_id:=base_link \
   -p radius:=0.03 -p wheel_base:=0.30 \
+
   -p echo_interval:=0.5 -p arduino_raw_topic:=/arduino/raw
