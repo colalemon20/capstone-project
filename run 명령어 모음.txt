@@ -1,4 +1,4 @@
-colcon build --packages-select rosA
+colcon build --packages-select rosA 김성남
 
 ros2 run demo_nodes_cpp listener
 
@@ -32,3 +32,4 @@ ros2 run rosA wheel_odom_publisher --ros-args \
   -p radius:=0.03 -p wheel_base:=0.30 \
 
   -p echo_interval:=0.5 -p arduino_raw_topic:=/arduino/raw
+
