@@ -1,0 +1,143 @@
+#include <Arduino.h>
+
+/* ================== 사용자 확정 핀맵 ================== */
+// PWM + CW + CCW (3핀 제어)
+const byte L_PWM  = 10, L_CW  = 13, L_CCW = 6;   // Left motor (주의: CW=시계방향=후진)
+const byte R_PWM  =  9, R_CW  = 12, R_CCW = 5;   // Right motor
+// (요청 핀 제공: ENC_L_A=3, ENC_R_A=2 — 본 스케치에선 인코더 미사용)
+const byte ENC_L_A = 3;
+const byte ENC_R_A = 2;
+
+/* ================== 동작 파라미터 ===================== */
+// 입력 프로토콜: 시리얼로 "<v,w>" 수신 (줄바꿈 여부 무관)
+// v: -1.0..+1.0 (전/후진), w: -1.0..+1.0 (좌/우 제자리 회전)
+const unsigned long CMD_TIMEOUT_MS = 150;  // 이 시간 이상 명령 없으면 정지
+const int MIN_PWM = 60;                    // 데드밴드 보정(40~90 사이 튜닝)
+const float TURN_GAIN = 1.0f;              // 회전 감도 가중치(필요시 0.8~1.2 조정)
+
+/* 좌/우 바퀴 ‘전진’ 방향 보정
+   - Left: CW가 후진이므로 전진을 위해 CCW가 켜져야 함 → sign = -1
+   - Right: 일반적으로 CW=전진 → sign = +1
+*/
+const int FORWARD_SIGN_LEFT  = -1;
+const int FORWARD_SIGN_RIGHT = +1;
+
+/* ================== 내부 상태/버퍼 ==================== */
+static inline float clampf(float x, float lo, float hi) {
+  return x < lo ? lo : (x > hi ? hi : x);
+}
+char inBuf[40];
+byte idx = 0;
+bool receiving = false;
+unsigned long lastCmdTime = 0;
+
+/* ================== 모터 제어 유틸 ==================== */
+static inline void driveWheel(byte pwmPin, byte cwPin, byte ccwPin,
+                              float speed_norm, int forward_sign) {
+  // speed_norm: -1..+1 (로봇 좌표계 기준 전/후진 크기)
+  speed_norm = clampf(speed_norm, -1.0f, 1.0f);
+
+  if (fabs(speed_norm) < 1e-3f) {
+    // Coast 정지(필요 시 브레이크 정지로 바꾸려면 둘 다 HIGH)
+    digitalWrite(cwPin, LOW);
+    digitalWrite(ccwPin, LOW);
+    analogWrite(pwmPin, 0);
+    return;
+  }
+
+  int pwm = (int)(fabs(speed_norm) * 255.0f);
+  pwm = constrain(pwm, 0, 255);
+  if (pwm > 0 && pwm < MIN_PWM) pwm = MIN_PWM; // 데드밴드 보정
+
+  // 실제 회전 방향 결정
+  float eff = speed_norm * forward_sign; // eff>0 → CW, eff<0 → CCW
+  if (eff > 0) {
+    digitalWrite(cwPin, HIGH);
+    digitalWrite(ccwPin, LOW);
+  } else {
+    digitalWrite(cwPin, LOW);
+    digitalWrite(ccwPin, HIGH);
+  }
+  analogWrite(pwmPin, pwm);
+}
+
+static inline void stopMotors() {
+  driveWheel(L_PWM, L_CW, L_CCW, 0.0f, FORWARD_SIGN_LEFT);
+  driveWheel(R_PWM, R_CW, R_CCW, 0.0f, FORWARD_SIGN_RIGHT);
+}
+
+/* v,w(-1..1) → 좌우 속도(-1..1) 계산 후 출력 */
+static inline void setVW(float v, float w) {
+  // 회전 감도 반영
+  w *= TURN_GAIN;
+
+  // 단순 합/차로 회전 충분히 나오게
+  float vL = v - w;
+  float vR = v + w;
+
+  // 좌/우 동시에 클리핑: 둘 중 큰 값이 1 넘으면 비율 축소
+  float m = max(fabs(vL), fabs(vR));
+  if (m > 1.0f) { vL /= m; vR /= m; }
+
+  driveWheel(L_PWM, L_CW, L_CCW, vL, FORWARD_SIGN_LEFT);
+  driveWheel(R_PWM, R_CW, R_CCW, vR, FORWARD_SIGN_RIGHT);
+}
+
+/* ================== 시리얼 수신/파싱 ================== */
+void readSerialFrame() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+
+    if (c == '<') { receiving = true; idx = 0; }
+    else if (c == '>' && receiving) {
+      // 프레임 완성
+      inBuf[idx] = '\0';
+      receiving = false;
+
+      // 포맷: "v,w"
+      char *comma = strchr(inBuf, ',');
+      if (comma) {
+        *comma = '\0';
+        float v = atof(inBuf);
+        float w = atof(comma + 1);
+
+        // 기대 입력: -1..+1
+        v = clampf(v, -1.0f, 1.0f);
+        w = clampf(w, -1.0f, 1.0f);
+
+        setVW(v, w);
+        lastCmdTime = millis();
+      }
+    }
+    else if (receiving) {
+      if (idx < sizeof(inBuf) - 1) inBuf[idx++] = c;
+      // 초과는 자동 드롭
+    }
+  }
+}
+
+/* ================== 표준 아두이노 함수 ================= */
+void setup() {
+  pinMode(L_CW, OUTPUT);   pinMode(L_CCW, OUTPUT);   pinMode(L_PWM, OUTPUT);
+  pinMode(R_CW, OUTPUT);   pinMode(R_CCW, OUTPUT);   pinMode(R_PWM, OUTPUT);
+  digitalWrite(L_CW, LOW); digitalWrite(L_CCW, LOW); analogWrite(L_PWM, 0);
+  digitalWrite(R_CW, LOW); digitalWrite(R_CCW, LOW); analogWrite(R_PWM, 0);
+
+  // (인코더는 본 스케치에선 미사용—핀 예약만)
+  pinMode(ENC_L_A, INPUT_PULLUP);
+  pinMode(ENC_R_A, INPUT_PULLUP);
+
+  Serial.begin(115200);
+  while (!Serial) {}
+
+  lastCmdTime = millis();
+}
+
+void loop() {
+  readSerialFrame();
+
+  // 안전 정지 타임아웃
+  if (millis() - lastCmdTime > CMD_TIMEOUT_MS) {
+    stopMotors();
+  }
+}

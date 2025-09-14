@@ -1,0 +1,12 @@
+#!/bin/bash
+
+
+
+docker start ros2_humble_gui
+
+docker exec -it ros2_humble_gui bash -c "
+  cd /ros2_ws && \
+  colcon build && \
+  source install/setup.bash && \
+  exec bash
+"

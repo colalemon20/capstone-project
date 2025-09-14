@@ -1,0 +1,10 @@
+const byte L_PWM  = 10, L_CW  = 13,  L_CCW = 6;
+
+const byte R_PWM  =  9, R_CW  = 12, R_CCW =  5;
+
+const byte ENC_L_A = 3, 
+const byte ENC_R_A =2 , 
+
+
+ENC_L_B = 4; 
+ENC_R_B =7; 

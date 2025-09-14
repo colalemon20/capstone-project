@@ -1,0 +1,34 @@
+colcon build --packages-select rosA
+
+ros2 run demo_nodes_cpp listener
+
+
+cmd_vel 발행:
+ros2 run teleop_twist_keyboard teleop_twist_keyboard \
+  --ros-args -p speed:=0.30 -p turn:=2.0
+
+
+브릿지 노드 실행:
+ros2 run rosA serial_diff_drive_bridge --ros-args \
+  -p serial_port:=/dev/ttyACM0 -p baudrate:=115200 \
+  -p max_v:=0.30 -p max_w:=2.0 -p cmd_timeout:=0.5
+
+ros2 run rosA serial_diff_drive_bridge --ros-args \
+  -p serial_port:=/dev/ttyACM0 -p baudrate:=115200 \
+  -p echo_arduino_lines:=true -p echo_interval:=0.5
+
+
+ros2 run rosA wheel_odom_publisher --ros-args \
+  -p serial_port:=/dev/ttyACM0 -p baudrate:=115200 \
+  -p radius:=0.03 -p wheel_base:=0.30 \
+  -p frame_id:=odom -p child_frame_id:=base_link \
+  -p topic:=/odom -p publish_tf:=true
+
+
+
+ros2 run rosA wheel_odom_publisher --ros-args \
+  -p serial_port:=/dev/ttyACM0 -p baudrate:=115200 \
+  -p cmd_topic:=/cmd_vel -p max_v:=0.30 -p max_w:=2.0 \
+  -p odom_topic:=/odom -p frame_id:=odom -p child_frame_id:=base_link \
+  -p radius:=0.03 -p wheel_base:=0.30 \
+  -p echo_interval:=0.5 -p arduino_raw_topic:=/arduino/raw

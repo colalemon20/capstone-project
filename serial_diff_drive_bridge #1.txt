@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+노트북에서 퍼블리시한 /cmd_vel (geometry_msgs/Twist)을 구독해서
+아두이노로 시리얼 전송하는 브리지 노드.
+
+● 전송 포맷(기본): "<+0.123,-0.456>\n"  (v_norm, w_norm 각각 -1.0 ~ +1.0)
+    - v_norm = clamp(linear.x / max_v)
+    - w_norm = clamp(angular.z / max_w)
+● 타임아웃: cmd_timeout 초 동안 명령 없으면 자동으로 "<0.000,0.000>\n" 전송
+● 10Hz로 현재 v, ω 로그 출력
+"""
+
+import time
+import serial
+import serial.tools.list_ports
+from math import copysign
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from geometry_msgs.msg import Twist
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+class SerialDiffDriveBridge(Node):
+    def __init__(self):
+        super().__init__('serial_diff_drive_bridge')
+
+        # ── Parameters ─────────────────────────────────────────────
+        self.declare_parameter('serial_port', '/dev/ttyACM0')
+        self.declare_parameter('baudrate', 115200)
+        self.declare_parameter('max_v', 0.30)           # [m/s] v 정규화 기준
+        self.declare_parameter('max_w', 2.00)           # [rad/s] ω 정규화 기준
+        self.declare_parameter('cmd_timeout', 0.5)      # [s] 무명령 시 정지 전송
+        self.declare_parameter('log_hz', 10.0)          # [Hz] v, ω 로그 주기
+        self.declare_parameter('frame_format', '<{:+.3f},{:+.3f}>\n')  # 시리얼 프레임
+
+        self.port = self.get_parameter('serial_port').get_parameter_value().string_value
+        self.baudrate = self.get_parameter('baudrate').get_parameter_value().integer_value
+        self.max_v = float(self.get_parameter('max_v').value)
+        self.max_w = float(self.get_parameter('max_w').value)
+        self.cmd_timeout = float(self.get_parameter('cmd_timeout').value)
+        self.log_dt = 1.0 / float(self.get_parameter('log_hz').value)
+        self.frame_format = str(self.get_parameter('frame_format').value)
+
+        # ── State ─────────────────────────────────────────────────
+        self.ser = None
+        self.last_cmd_time = time.monotonic() - 999.0
+        self.last_tx_stop = True
+        self.last_v = 0.0
+        self.last_w = 0.0
+        self.last_log = 0.0
+
+        # ── QoS: teleop 연결 안정성 위해 기본 Reliable/KeepLast ──
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        # ── Subscriber ────────────────────────────────────────────
+        self.sub = self.create_subscription(Twist, 'cmd_vel', self.cb_cmd_vel, qos)
+
+        # ── Timers ────────────────────────────────────────────────
+        self.timer_main = self.create_timer(0.01, self.on_timer_10ms)     # 100 Hz 워치독/송신/로그
+        self.timer_serial = self.create_timer(1.0, self.try_open_serial)  # 1초마다 재연결 시도
+
+        self.get_logger().info(
+            f"Start bridge: port={self.port} baud={self.baudrate} "
+            f"max_v={self.max_v:.3f} m/s, max_w={self.max_w:.3f} rad/s"
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    # Serial handling
+    # ──────────────────────────────────────────────────────────────
+    def try_open_serial(self):
+        if self.ser and self.ser.is_open:
+            return
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=0.0)
+            self.get_logger().info(f'Open {self.port} @{self.baudrate}')
+        except serial.SerialException as e:
+            self.get_logger().warn(f'Failed to open {self.port}: {e}')
+
+    def send_frame(self, v_norm: float, w_norm: float):
+        if not (self.ser and self.ser.is_open):
+            return
+        frame = self.frame_format.format(v_norm, w_norm)
+        try:
+            self.ser.write(frame.encode('ascii'))
+        except serial.SerialException as e:
+            self.get_logger().warn(f'Serial write error: {e}')
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+
+    # ──────────────────────────────────────────────────────────────
+    # ROS callbacks
+    # ──────────────────────────────────────────────────────────────
+    def cb_cmd_vel(self, msg: Twist):
+        # 정규화
+        v_norm = clamp(msg.linear.x / self.max_v, -1.0, 1.0)
+        w_norm = clamp(msg.angular.z / self.max_w, -1.0, 1.0)
+
+        # 즉시 전송(지연 최소화)
+        self.send_frame(v_norm, w_norm)
+
+        # 상태 갱신
+        self.last_cmd_time = time.monotonic()
+        self.last_v = float(msg.linear.x)
+        self.last_w = float(msg.angular.z)
+        self.last_tx_stop = (abs(v_norm) < 1e-6 and abs(w_norm) < 1e-6)
+
+    # 100 Hz 주기: 워치독/로그
+    def on_timer_10ms(self):
+        now = time.monotonic()
+
+        # 타임아웃 → 정지 프레임 1회 보냄
+        if (now - self.last_cmd_time) > self.cmd_timeout:
+            if not self.last_tx_stop:
+                self.send_frame(0.0, 0.0)
+                self.last_v = 0.0
+                self.last_w = 0.0
+                self.last_tx_stop = True
+
+        # 주기 로그 (v, ω)
+        if (now - self.last_log) >= self.log_dt:
+            self.get_logger().info(f'v = {self.last_v:.3f} m/s,  ω = {self.last_w:.3f} rad/s')
+            self.last_log = now
+
+
+def main():
+    rclpy.init()
+    node = SerialDiffDriveBridge()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node.ser and node.ser.is_open:
+            try:
+                node.send_frame(0.0, 0.0)  # 종료 시 안전 정지
+                node.ser.close()
+            except Exception:
+                pass
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
